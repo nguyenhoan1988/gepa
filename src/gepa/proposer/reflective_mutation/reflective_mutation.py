@@ -4,7 +4,7 @@
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from gepa.core.adapter import DataInst, GEPAAdapter, ProposalFn, RolloutOutput, Trajectory
+from gepa.core.adapter import DataInst, EvaluationBatch, GEPAAdapter, ProposalFn, RolloutOutput, Trajectory
 from gepa.core.callbacks import (
     CandidateSelectedEvent,
     EvaluationEndEvent,
@@ -177,8 +177,7 @@ class ReflectiveMutationProposer(ProposeNewCandidate[DataId]):
             ),
         )
 
-        # 1) Evaluate current program with traces
-        # Note: We don't use cache for capture_traces=True evaluations since we need fresh traces for reflection
+        # 1) Evaluate current program with traces (cache-aware)
         curr_parent_ids = [p for p in state.parent_program_for_candidate[curr_prog_id] if p is not None]
         is_seed_candidate = curr_prog_id == 0
         notify_callbacks(
@@ -194,8 +193,58 @@ class ReflectiveMutationProposer(ProposeNewCandidate[DataId]):
                 is_seed_candidate=is_seed_candidate,
             ),
         )
-        eval_curr = self.adapter.evaluate(minibatch, curr_prog, capture_traces=True)
-        state.increment_evals(len(subsample_ids))
+
+        # Check cache for entries that already have trajectories
+        if state.evaluation_cache is not None:
+            cached_results, uncached_ids = state.evaluation_cache.get_batch(curr_prog, subsample_ids)
+            # Entries cached without trajectories still need re-evaluation
+            cached_with_traj = {eid: e for eid, e in cached_results.items() if e.trajectory is not None}
+            ids_needing_eval = uncached_ids + [eid for eid in cached_results if eid not in cached_with_traj]
+
+            if ids_needing_eval:
+                batch_to_eval = self.trainset.fetch(ids_needing_eval)
+                eval_fresh = self.adapter.evaluate(batch_to_eval, curr_prog, capture_traces=True)
+                # Write fresh results (with trajectories) into cache
+                obj_scores_list = list(eval_fresh.objective_scores) if eval_fresh.objective_scores else None
+                state.evaluation_cache.put_batch(
+                    curr_prog, ids_needing_eval, eval_fresh.outputs, eval_fresh.scores,
+                    obj_scores_list, trajectories=eval_fresh.trajectories,
+                )
+                fresh_outputs = dict(zip(ids_needing_eval, eval_fresh.outputs))
+                fresh_scores = dict(zip(ids_needing_eval, eval_fresh.scores))
+                fresh_trajs = dict(zip(ids_needing_eval, eval_fresh.trajectories)) if eval_fresh.trajectories else {}
+                fresh_obj = dict(zip(ids_needing_eval, eval_fresh.objective_scores)) if eval_fresh.objective_scores else {}
+            else:
+                fresh_outputs, fresh_scores, fresh_trajs, fresh_obj = {}, {}, {}, {}
+
+            state.increment_evals(len(ids_needing_eval))
+
+            # Merge cached + fresh results in subsample order
+            all_outputs, all_scores, all_trajs, all_obj = [], [], [], []
+            for eid in subsample_ids:
+                if eid in cached_with_traj:
+                    e = cached_with_traj[eid]
+                    all_outputs.append(e.output)
+                    all_scores.append(e.score)
+                    all_trajs.append(e.trajectory)
+                    all_obj.append(e.objective_scores)
+                else:
+                    all_outputs.append(fresh_outputs[eid])
+                    all_scores.append(fresh_scores[eid])
+                    all_trajs.append(fresh_trajs.get(eid))
+                    all_obj.append(fresh_obj.get(eid))
+
+            eval_curr = EvaluationBatch(
+                outputs=all_outputs,
+                scores=all_scores,
+                trajectories=all_trajs,
+                objective_scores=all_obj if any(o is not None for o in all_obj) else None,
+            )
+        else:
+            # No cache: evaluate all directly
+            eval_curr = self.adapter.evaluate(minibatch, curr_prog, capture_traces=True)
+            state.increment_evals(len(subsample_ids))
+
         state.full_program_trace[-1]["subsample_scores"] = eval_curr.scores
         notify_callbacks(
             self.callbacks,
@@ -212,13 +261,6 @@ class ReflectiveMutationProposer(ProposeNewCandidate[DataId]):
                 is_seed_candidate=is_seed_candidate,
             ),
         )
-
-        # Update cache with current program evaluation results (for future reuse when capture_traces=False)
-        if state.evaluation_cache is not None:
-            objective_scores_list = list(eval_curr.objective_scores) if eval_curr.objective_scores else None
-            state.evaluation_cache.put_batch(
-                curr_prog, subsample_ids, eval_curr.outputs, eval_curr.scores, objective_scores_list
-            )
 
         if not eval_curr.trajectories or len(eval_curr.trajectories) == 0:
             self.logger.log(f"Iteration {i}: No trajectories captured. Skipping.")
