@@ -210,10 +210,10 @@ class ReflectiveMutationProposer(ProposeNewCandidate[DataId]):
                     curr_prog, ids_needing_eval, eval_fresh.outputs, eval_fresh.scores,
                     obj_scores_list, trajectories=eval_fresh.trajectories,
                 )
-                fresh_outputs = dict(zip(ids_needing_eval, eval_fresh.outputs))
-                fresh_scores = dict(zip(ids_needing_eval, eval_fresh.scores))
-                fresh_trajs = dict(zip(ids_needing_eval, eval_fresh.trajectories)) if eval_fresh.trajectories else {}
-                fresh_obj = dict(zip(ids_needing_eval, eval_fresh.objective_scores)) if eval_fresh.objective_scores else {}
+                fresh_outputs = dict(zip(ids_needing_eval, eval_fresh.outputs, strict=False))
+                fresh_scores = dict(zip(ids_needing_eval, eval_fresh.scores, strict=False))
+                fresh_trajs = dict(zip(ids_needing_eval, eval_fresh.trajectories, strict=False)) if eval_fresh.trajectories else {}
+                fresh_obj = dict(zip(ids_needing_eval, eval_fresh.objective_scores, strict=False)) if eval_fresh.objective_scores else {}
             else:
                 fresh_outputs, fresh_scores, fresh_trajs, fresh_obj = {}, {}, {}, {}
 
